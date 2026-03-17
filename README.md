@@ -20,6 +20,8 @@ Result: you pay for Tier 2 only when Tier 0 and Tier 1 can't confidently pass or
 
 ## Architecture
 
+### Tier overview
+
 | Tier | What it does              | Cost   | When it runs                    |
 |------|---------------------------|--------|----------------------------------|
 | 0    | Rule-based checks         | $0     | Always first (if enabled)       |
@@ -27,6 +29,90 @@ Result: you pay for Tier 2 only when Tier 0 and Tier 1 can't confidently pass or
 | 2    | Slow LLM (e.g. gpt-4o)    | Higher | When Tier 1 score is below threshold |
 
 Each tier has configurable pass/fail thresholds that control escalation.
+
+### Module flow: what feeds into what
+
+```
+User code
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  evaluator.py (GradedJudge)                                              │
+│  • Entry point: evaluate() / evaluate_batch()                            │
+│  • Loads config (config.py or models.GradedJudgeConfig.from_yaml)         │
+│  • Builds Tier0 from config + rules; builds Tier1/Tier2 from providers    │
+│  • Calls pipeline.run_pipeline() for each evaluation                     │
+│  • Appends each result to session list; feeds CostTracker (cost.py)      │
+│  • summarize() → reporting.summary.generate_run_summary()                  │
+│  • export_results() → writes session results to JSON                     │
+└─────────────────────────────────────────────────────────────────────────┘
+    │
+    │  EvaluationInput (models.py)
+    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  pipeline.py (run_pipeline)                                              │
+│  • Orchestrates tiers in order; short-circuits when a tier passes        │
+│  • tier0.run(input) → TierResult; if not escalated, return result        │
+│  • tier1.run(input) → TierResult; if not escalated, return result       │
+│  • tier2.run(input) → TierResult; always return (final verdict)          │
+│  • Aggregates tier_results, cost, latency → EvaluationResult (models.py) │
+└─────────────────────────────────────────────────────────────────────────┘
+    │
+    ├──────────────────────────────────┬──────────────────────────────────┐
+    ▼                                  ▼                                  ▼
+┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
+│  tiers/tier0.py  │          │  tiers/tier1.py  │          │  tiers/tier2.py  │
+│  • Runs each     │          │  • Builds judge  │          │  • Builds       │
+│    rule in       │          │    prompt        │          │    extended     │
+│    rules/        │          │  • provider.     │          │    judge prompt │
+│  • No LLM        │          │    complete()    │          │  • provider.    │
+│  • Returns       │          │  • Parses JSON   │          │    complete()   │
+│    TierResult    │          │    score/reason  │          │  • Parses JSON  │
+│    (escalate if  │          │  • Escalates if  │          │    verdict      │
+│    failures ≥    │          │    score <       │          │  • Never        │
+│    threshold)    │          │    threshold     │          │    escalates    │
+└────────┬────────┘          └────────┬────────┘          └────────┬────────┘
+         │                            │                            │
+         ▼                            │                            │
+┌─────────────────┐                   │                            │
+│  rules/         │                   │                            │
+│  base.py        │                   │                            │
+│  length.py      │                   └────────────┬───────────────┘
+│  pattern.py     │                                │
+│  schema.py      │                                ▼
+└─────────────────┘                   ┌─────────────────────────────┐
+         │                            │  providers/                 │
+         │                            │  base.py (interface)        │
+         │                            │  mock.py, openai.py,        │
+         │                            │  bedrock.py, ollama.py      │
+         │                            │  • complete() → text, cost,  │
+         │                            │    latency_ms                │
+         │                            └─────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  models.py (shared data)                                                  │
+│  EvaluationInput, EvaluationResult, TierResult, RunSummary,             │
+│  CostReport, GradedJudgeConfig — used by evaluator, pipeline, tiers,      │
+│  cost, config, reporting                                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data flow summary
+
+1. **User** calls `GradedJudge(config).evaluate(input=..., output=..., criteria=...)` or `evaluate_batch(inputs)`.
+
+2. **evaluator** builds an `EvaluationInput` (and, from config, Tier0 with rules and Tier1/Tier2 with providers), then calls **pipeline** `run_pipeline(input, config, tier0, tier1, tier2)`.
+
+3. **pipeline** runs **Tier0** first (if enabled). Tier0 calls each **rule** in `rules/` (length, pattern, schema, etc.); if the failure count is below threshold, pipeline returns an `EvaluationResult` and stops. Otherwise it runs **Tier1**.
+
+4. **Tier1** builds a prompt, calls **provider** (OpenAI, Bedrock, Ollama, or Mock) `complete()`, parses the JSON score. If score ≥ threshold, pipeline returns the result. Otherwise it runs **Tier2**.
+
+5. **Tier2** builds an extended prompt, calls **provider** again, parses the final verdict, and pipeline returns that as the **EvaluationResult** (no further escalation).
+
+6. **evaluator** appends the result to the session list and, if cost tracking is on, passes it to **cost.CostTracker**. `summarize()` uses **reporting.summary** to turn the session list into a **RunSummary** (and optionally `print_summary()` for console output).
+
+**Config** is loaded in evaluator from `config.py` (`load_config`) or `GradedJudgeConfig.from_yaml()`; **models** define the structures used at every step.
 
 ## Installation
 
@@ -156,6 +242,21 @@ Export results to JSON:
 ```python
 judge.export_results("results.json")
 ```
+
+## Problems to Solve
+
+These are known limitations and planned improvements. Contributions welcome.
+
+| Area | Problem | Notes |
+|------|---------|--------|
+| **Provider resolution** | Provider selection is a hardcoded `if/else` in the evaluator. | Replace with a pluggable provider registry (e.g. register by name, resolve from config or env). |
+| **Rule parameters from config** | `rules` in config is a list of rule *names* only. Parameterized rules (e.g. `MinLengthRule(10)`) fall back to hardcoded defaults. | Extend config (e.g. YAML) to support rule args: `MinLengthRule: { min_chars: 10 }` so rules are fully configurable without code changes. |
+| **JSON Schema support** | `JsonSchemaRule` uses a minimal custom validator (type, required, nested properties). | Support full JSON Schema (e.g. via `jsonschema` library): `integer`, `boolean`, `null`, `minLength`, `maxLength`, `pattern`, `enum`, etc. |
+| **Log level** | `GradedJudgeConfig.log_level` exists but is never applied to the logging framework. | On `GradedJudge` init (or in `load_config`), set `logging.getLogger("graded_judge").setLevel(config.log_level)` (or equivalent). |
+| **LLM retries** | Providers do not retry on transient failures (rate limits, timeouts). | Add configurable retry with backoff for Tier 1 and Tier 2 provider calls. |
+| **Token counting** | Cost uses a simple estimate (`len(text.split()) * 1.3`). | For OpenAI, optionally use `tiktoken` (or similar) for accurate token counts and cost. |
+| **Batch execution** | `evaluate_batch()` runs evaluations sequentially. | Optional async or parallel execution for large batches (with care for rate limits). |
+| **API documentation** | No generated API docs. | Add Sphinx or MkDocs and document public classes and methods. |
 
 ## Contributing
 

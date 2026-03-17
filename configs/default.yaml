@@ -1,0 +1,14 @@
+tier0_enabled: true
+tier1_enabled: true
+tier2_enabled: true
+tier0_fail_threshold: 1
+tier1_pass_threshold: 0.7
+tier1_model: gpt-4o-mini
+tier2_model: gpt-4o
+tier1_provider: openai
+tier2_provider: openai
+tier1_max_tokens: 512
+tier2_max_tokens: 1024
+rules: []
+cost_tracking_enabled: true
+log_level: INFO
